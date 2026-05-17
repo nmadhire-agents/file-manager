@@ -1,0 +1,22 @@
+[project]
+name = "intent-classifier"
+version = "0.1.0"
+description = "A simple file-manager intent classifier agent."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=2.0.0",
+    "pydantic>=2.0.0",
+]
+
+[project.scripts]
+filemanager = "intent_classifier.file_manager:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
