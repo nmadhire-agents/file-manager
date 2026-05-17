@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from intent_classifier.file_manager import (
+    CommandMemory,
+    CommandResult,
     DEFAULT_MODEL,
     FileCommand,
     FileManagerAgent,
@@ -18,8 +21,10 @@ from intent_classifier.file_manager import (
 class StaticClassifier:
     def __init__(self, command: FileCommand) -> None:
         self.command = command
+        self.calls = 0
 
     def classify(self, question: str) -> FileCommand:
+        self.calls += 1
         return self.command
 
 
@@ -39,7 +44,16 @@ class StubClient:
 
 
 def agent_for(command: FileCommand, tmp_path: Path, allow_risky: bool = False) -> FileManagerAgent:
-    return FileManagerAgent(tmp_path, classifier=StaticClassifier(command), allow_risky=allow_risky)
+    return FileManagerAgent(
+        tmp_path,
+        classifier=StaticClassifier(command),
+        allow_risky=allow_risky,
+        memory=memory_for(tmp_path),
+    )
+
+
+def memory_for(tmp_path: Path) -> CommandMemory:
+    return CommandMemory(tmp_path.parent / f"{tmp_path.name}-filemanager-cache")
 
 
 def test_llm_classifier_creates_directory_from_desire_style_question() -> None:
@@ -175,6 +189,146 @@ def test_writes_file_from_classified_command(tmp_path: Path) -> None:
     assert (tmp_path / "notes.txt").read_text() == "hello"
 
 
+def test_repeated_identical_request_uses_cached_command(tmp_path: Path) -> None:
+    memory = memory_for(tmp_path)
+    classifier = StaticClassifier(FileCommand("create_file", {"target": "notes.txt"}))
+    agent = FileManagerAgent(tmp_path, classifier=classifier, memory=memory)
+
+    first = agent.run("please create a file named notes.txt")
+    (tmp_path / "notes.txt").unlink()
+    second = agent.run("please create a file named notes.txt")
+
+    assert first.success is True
+    assert second.success is True
+    assert classifier.calls == 1
+    assert (tmp_path / "notes.txt").is_file()
+
+
+def test_no_cache_bypasses_cached_command(tmp_path: Path) -> None:
+    memory = memory_for(tmp_path)
+    memory.cache_command("create a file", FileCommand("create_file", {"target": "cached.txt"}))
+    classifier = StaticClassifier(FileCommand("create_file", {"target": "fresh.txt"}))
+    agent = FileManagerAgent(tmp_path, classifier=classifier, memory=memory, use_cache=False)
+
+    result = agent.run("create a file")
+
+    assert result.success is True
+    assert classifier.calls == 1
+    assert not (tmp_path / "cached.txt").exists()
+    assert (tmp_path / "fresh.txt").is_file()
+
+
+def test_risky_and_delete_classifications_are_not_reused_from_cache(tmp_path: Path) -> None:
+    memory = memory_for(tmp_path)
+    memory.cache_command(
+        "overwrite notes",
+        FileCommand("write_file", {"target": "notes.txt", "content": "new"}, requires_confirmation=True),
+    )
+    memory.cache_command("delete notes", FileCommand("delete_path", {"target": "notes.txt"}))
+
+    assert memory.cached_command("overwrite notes") is None
+    assert memory.cached_command("delete notes") is None
+
+
+def test_history_resolves_rename_it_without_llm(tmp_path: Path) -> None:
+    memory = memory_for(tmp_path)
+    classifier = StaticClassifier(FileCommand("create_directory", {"target": "goal"}))
+    agent = FileManagerAgent(tmp_path, classifier=classifier, memory=memory)
+
+    created = agent.run("create a directory named goal")
+    renamed = agent.run("rename it to archive")
+
+    assert created.success is True
+    assert renamed.success is True
+    assert classifier.calls == 1
+    assert not (tmp_path / "goal").exists()
+    assert (tmp_path / "archive").is_dir()
+
+
+def test_history_resolves_read_it_without_llm(tmp_path: Path) -> None:
+    (tmp_path / "notes.txt").write_text("hello")
+    memory = memory_for(tmp_path)
+    classifier = StaticClassifier(FileCommand("read_file", {"target": "notes.txt"}))
+    agent = FileManagerAgent(tmp_path, classifier=classifier, memory=memory)
+
+    first = agent.run("read notes.txt")
+    second = agent.run("read it")
+
+    assert first.message == "hello"
+    assert second.message == "hello"
+    assert classifier.calls == 1
+
+
+def test_ambiguous_follow_up_returns_clarification_without_llm(tmp_path: Path) -> None:
+    memory = memory_for(tmp_path)
+    classifier = StaticClassifier(FileCommand("create_file", {"target": "should-not-run.txt"}))
+    agent = FileManagerAgent(tmp_path, classifier=classifier, memory=memory)
+
+    result = agent.run("rename it")
+
+    assert result.success is False
+    assert result.intent == "clarification_required"
+    assert classifier.calls == 0
+    assert not (tmp_path / "should-not-run.txt").exists()
+
+
+def test_history_resolves_delete_it_but_requires_confirmation(tmp_path: Path) -> None:
+    (tmp_path / "notes.txt").write_text("hello")
+    memory = memory_for(tmp_path)
+    classifier = StaticClassifier(FileCommand("read_file", {"target": "notes.txt"}))
+    agent = FileManagerAgent(tmp_path, classifier=classifier, memory=memory)
+
+    agent.run("read notes.txt")
+    result = agent.run("delete it")
+
+    assert result.success is False
+    assert result.requires_confirmation is True
+    assert classifier.calls == 1
+    assert (tmp_path / "notes.txt").exists()
+
+
+def test_cached_path_escape_is_still_rejected(tmp_path: Path) -> None:
+    memory = memory_for(tmp_path)
+    memory.cache_command("make outside", FileCommand("create_file", {"target": "../outside.txt"}))
+    classifier = StaticClassifier(FileCommand("create_file", {"target": "should-not-run.txt"}))
+    agent = FileManagerAgent(tmp_path, classifier=classifier, memory=memory)
+
+    with pytest.raises(ValueError):
+        agent.run("make outside")
+
+    assert classifier.calls == 0
+
+
+def test_history_path_escape_is_still_rejected(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside.txt"
+    outside.write_text("outside")
+    memory = memory_for(tmp_path)
+    memory.cache_dir.mkdir(parents=True, exist_ok=True)
+    memory.action_history_path.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-05-17T00:00:00+00:00",
+                "question": "malicious history",
+                "root": str(tmp_path),
+                "intent": "read_file",
+                "params": {"target": "../outside.txt"},
+                "requires_confirmation": False,
+                "path": "../outside.txt",
+                "message": "outside",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    classifier = StaticClassifier(FileCommand("read_file", {"target": "should-not-run.txt"}))
+    agent = FileManagerAgent(tmp_path, classifier=classifier, memory=memory)
+
+    with pytest.raises(ValueError):
+        agent.run("read it")
+
+    assert classifier.calls == 0
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -287,6 +441,8 @@ def test_cli_yes_allows_confirmed_delete(
 ) -> None:
     target = tmp_path / "old.txt"
     target.touch()
+    memory_dir = tmp_path / ".filemanager-cache"
+    original_memory = CommandMemory
 
     class CliClassifier:
         def classify(self, question: str) -> FileCommand:
@@ -295,6 +451,10 @@ def test_cli_yes_allows_confirmed_delete(
     monkeypatch.setattr(
         "intent_classifier.file_manager.LLMIntentClassifier",
         lambda: CliClassifier(),
+    )
+    monkeypatch.setattr(
+        "intent_classifier.file_manager.CommandMemory",
+        lambda: original_memory(memory_dir),
     )
     monkeypatch.setattr(
         "sys.argv",
@@ -312,7 +472,71 @@ def test_cli_missing_openai_api_key_returns_error(
     tmp_path: Path,
 ) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    original_memory = CommandMemory
+    monkeypatch.setattr(
+        "intent_classifier.file_manager.CommandMemory",
+        lambda: original_memory(tmp_path / ".filemanager-cache"),
+    )
     monkeypatch.setattr("sys.argv", ["filemanager", "--root", str(tmp_path), "list files"])
 
     assert main() == 1
     assert "OPENAI_API_KEY is required" in capsys.readouterr().out
+
+
+def test_cli_clear_cache_removes_memory_files(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / ".filemanager-cache"
+    memory = CommandMemory(memory_dir)
+    memory.cache_command("create note", FileCommand("create_file", {"target": "notes.txt"}))
+    memory.append_history(
+        "create note",
+        FileCommand("create_file", {"target": "notes.txt"}),
+        result=CommandResult(
+            True,
+            "Created file: notes.txt",
+            "create_file",
+            tmp_path / "notes.txt",
+        ),
+        root=tmp_path,
+    )
+    original_memory = CommandMemory
+    monkeypatch.setattr(
+        "intent_classifier.file_manager.CommandMemory",
+        lambda: original_memory(memory_dir),
+    )
+    monkeypatch.setattr("sys.argv", ["filemanager", "--clear-cache"])
+
+    assert main() == 0
+    assert "Cleared filemanager cache and history." in capsys.readouterr().out
+    assert not memory.classification_cache_path.exists()
+    assert not memory.action_history_path.exists()
+
+
+def test_cli_history_prints_recent_actions(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / ".filemanager-cache"
+    memory = CommandMemory(memory_dir)
+    target = tmp_path / "notes.txt"
+    target.write_text("hello")
+    memory.append_history(
+        "read notes",
+        FileCommand("read_file", {"target": "notes.txt"}),
+        result=CommandResult(True, "hello", "read_file", target),
+        root=tmp_path,
+    )
+    original_memory = CommandMemory
+    monkeypatch.setattr(
+        "intent_classifier.file_manager.CommandMemory",
+        lambda: original_memory(memory_dir),
+    )
+    monkeypatch.setattr("sys.argv", ["filemanager", "--history"])
+
+    assert main() == 0
+    output = capsys.readouterr().out
+    assert "read_file notes.txt :: read notes" in output

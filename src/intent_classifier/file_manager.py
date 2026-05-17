@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import shutil
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
+from platformdirs import user_cache_dir
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict
@@ -169,6 +173,218 @@ class LLMIntentClassifier:
         return self.client
 
 
+class CommandMemory:
+    """Persistent exact-match classification cache and action history."""
+
+    def __init__(self, cache_dir: Path | str | None = None) -> None:
+        self.cache_dir = Path(cache_dir or user_cache_dir("filemanager", "intent-classifier"))
+        self.classification_cache_path = self.cache_dir / "classification_cache.json"
+        self.action_history_path = self.cache_dir / "action_history.jsonl"
+
+    def cached_command(self, question: str) -> FileCommand | None:
+        data = self._read_cache()
+        raw_command = data.get(self.normalize_question(question))
+        if not isinstance(raw_command, dict):
+            return None
+
+        command = self._command_from_dict(raw_command)
+        if not command or self._should_skip_cache(command):
+            return None
+        return command
+
+    def cache_command(self, question: str, command: FileCommand) -> None:
+        if self._should_skip_cache(command):
+            return
+
+        data = self._read_cache()
+        data[self.normalize_question(question)] = self._command_to_dict(command)
+        self._write_cache(data)
+
+    def append_history(
+        self,
+        question: str,
+        command: FileCommand,
+        result: CommandResult,
+        root: Path,
+    ) -> None:
+        if not result.success:
+            return
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "question": question,
+            "root": str(root),
+            "intent": command.intent,
+            "params": dict(command.params),
+            "requires_confirmation": command.requires_confirmation,
+            "path": self._relative_path(result.path, root),
+            "message": result.message,
+        }
+        with self.action_history_path.open("a", encoding="utf-8") as history_file:
+            history_file.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def resolve_follow_up(self, question: str, root: Path) -> FileCommand | None:
+        normalized = self.normalize_question(question)
+        last_path = self._last_known_path(root)
+        if last_path is None:
+            if self._looks_like_follow_up(normalized):
+                return FileCommand(
+                    "clarification_required",
+                    clarification_question="What file or directory does 'it' refer to?",
+                )
+            return None
+
+        rename_destination = self._rename_destination(question)
+        if rename_destination:
+            return FileCommand(
+                "rename_path",
+                {"source": last_path, "destination": rename_destination},
+            )
+
+        if re.fullmatch(r"(delete|remove) (it|that|this)", normalized):
+            return FileCommand("delete_path", {"target": last_path}, requires_confirmation=True)
+
+        if re.fullmatch(r"(read|show|open|display) (it|that|this)", normalized):
+            return FileCommand("read_file", {"target": last_path})
+
+        if self._looks_like_follow_up(normalized):
+            return FileCommand(
+                "clarification_required",
+                clarification_question="Please clarify the follow-up action and target.",
+            )
+
+        return None
+
+    def history_lines(self, limit: int = 20) -> list[str]:
+        records = self._read_history()
+        lines = []
+        for record in records[-limit:]:
+            timestamp = record.get("timestamp", "")
+            intent = record.get("intent", "unknown")
+            path = record.get("path") or "-"
+            question = record.get("question", "")
+            lines.append(f"{timestamp} {intent} {path} :: {question}")
+        return lines
+
+    def clear(self) -> None:
+        for path in (self.classification_cache_path, self.action_history_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def normalize_question(question: str) -> str:
+        return " ".join(question.strip().lower().split())
+
+    def _read_cache(self) -> dict[str, dict[str, object]]:
+        try:
+            raw = json.loads(self.classification_cache_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _write_cache(self, data: Mapping[str, object]) -> None:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.classification_cache_path.write_text(
+            json.dumps(data, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def _read_history(self) -> list[dict[str, object]]:
+        try:
+            lines = self.action_history_path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return []
+
+        records = []
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+        return records
+
+    def _last_known_path(self, root: Path) -> str | None:
+        for record in reversed(self._read_history()):
+            if record.get("root") != str(root):
+                continue
+
+            path = record.get("path")
+            if not isinstance(path, str) or not path:
+                continue
+
+            candidate = (root / path).resolve()
+            if candidate.exists():
+                return path
+        return None
+
+    def _rename_destination(self, question: str) -> str | None:
+        quoted = re.findall(r"['\"]([^'\"]+)['\"]", question)
+        if quoted:
+            return quoted[-1].strip()
+
+        match = re.fullmatch(
+            r"\s*(?:rename|move)\s+(?:it|that|this)\s+(?:to|as)\s+(.+?)[.!?]?\s*",
+            question,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).strip()
+        return None
+
+    def _looks_like_follow_up(self, normalized: str) -> bool:
+        return bool(re.search(r"\b(it|that|this)\b", normalized))
+
+    def _should_skip_cache(self, command: FileCommand) -> bool:
+        return command.requires_confirmation or command.intent == "delete_path"
+
+    def _command_to_dict(self, command: FileCommand) -> dict[str, object]:
+        return {
+            "intent": command.intent,
+            "params": dict(command.params),
+            "requires_confirmation": command.requires_confirmation,
+            "clarification_question": command.clarification_question,
+        }
+
+    def _command_from_dict(self, data: Mapping[str, object]) -> FileCommand | None:
+        intent = data.get("intent")
+        params = data.get("params", {})
+        requires_confirmation = data.get("requires_confirmation", False)
+        clarification_question = data.get("clarification_question")
+
+        if not isinstance(intent, str) or intent not in ALLOWED_INTENTS:
+            return None
+        if not isinstance(params, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in params.items()
+        ):
+            return None
+        if not isinstance(requires_confirmation, bool):
+            return None
+        if clarification_question is not None and not isinstance(clarification_question, str):
+            return None
+
+        return FileCommand(
+            intent,
+            params,
+            requires_confirmation=requires_confirmation,
+            clarification_question=clarification_question,
+        )
+
+    def _relative_path(self, path: Path | None, root: Path) -> str | None:
+        if path is None:
+            return None
+
+        try:
+            return str(path.resolve().relative_to(root))
+        except ValueError:
+            return None
+
+
 class FileManagerAgent:
     """Classifies user questions and executes safe file-management commands."""
 
@@ -177,10 +393,14 @@ class FileManagerAgent:
         root: Path | str | None = None,
         classifier: IntentClassifier | None = None,
         allow_risky: bool = False,
+        memory: CommandMemory | None = None,
+        use_cache: bool = True,
     ) -> None:
         self.root = Path(root or Path.cwd()).resolve()
         self.classifier = classifier or LLMIntentClassifier()
         self.allow_risky = allow_risky
+        self.memory = memory or CommandMemory()
+        self.use_cache = use_cache
         self.actions: dict[str, Callable[[FileCommand], CommandResult]] = {
             "create_directory": self._create_directory,
             "create_file": self._create_file,
@@ -196,15 +416,32 @@ class FileManagerAgent:
         }
 
     def run(self, question: str) -> CommandResult:
+        command = self._command_for_question(question)
+        result = self.execute(command)
+        self.memory.append_history(question, command, result, self.root)
+        return result
+
+    def _command_for_question(self, question: str) -> FileCommand:
+        if self.use_cache:
+            cached = self.memory.cached_command(question)
+            if cached:
+                return cached
+
+            follow_up = self.memory.resolve_follow_up(question, self.root)
+            if follow_up:
+                return follow_up
+
         try:
             command = self.classifier.classify(question)
         except ClassifierUnavailable as exc:
-            return CommandResult(
-                False,
-                f"{exc} Please clarify the file operation you want me to perform.",
+            return FileCommand(
                 "clarification_required",
+                clarification_question=f"{exc} Please clarify the file operation you want me to perform.",
             )
-        return self.execute(command)
+
+        if self.use_cache:
+            self.memory.cache_command(question, command)
+        return command
 
     def execute(self, command: FileCommand) -> CommandResult:
         action = self.actions.get(command.intent)
@@ -393,17 +630,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the filemanager intent classifier.")
     parser.add_argument("--root", default=None, help="Directory where file operations should run.")
     parser.add_argument("--yes", action="store_true", help="Confirm risky operations such as delete or overwrite.")
-    parser.add_argument("question", nargs="+", help="Natural-language request to execute.")
+    parser.add_argument("--no-cache", action="store_true", help="Bypass classification cache and force LLM classification.")
+    parser.add_argument("--clear-cache", action="store_true", help="Clear cached classifications and action history, then exit.")
+    parser.add_argument("--history", action="store_true", help="Print recent action history, then exit.")
+    parser.add_argument("question", nargs="*", help="Natural-language request to execute.")
     return parser
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    memory = CommandMemory()
+
+    if args.clear_cache:
+        memory.clear()
+        print("Cleared filemanager cache and history.")
+        return 0
+
+    if args.history:
+        lines = memory.history_lines()
+        print("\n".join(lines) if lines else "No filemanager history.")
+        return 0
+
+    if not args.question:
+        parser.error("question is required unless --clear-cache or --history is used")
+
     question = " ".join(args.question)
 
     try:
-        result = FileManagerAgent(root=args.root, allow_risky=args.yes).run(question)
+        result = FileManagerAgent(
+            root=args.root,
+            allow_risky=args.yes,
+            memory=memory,
+            use_cache=not args.no_cache,
+        ).run(question)
     except OSError as exc:
         print(f"Command failed: {exc}")
         return 1

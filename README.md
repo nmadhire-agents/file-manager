@@ -43,9 +43,15 @@ The agent only writes inside the working directory where it is run. Absolute pat
 ```bash
 uv run filemanager --root /some/path "create a file named notes.txt"
 uv run filemanager --yes "delete the folder named old-build"
+uv run filemanager --no-cache "create a file named notes.txt"
+uv run filemanager --history
+uv run filemanager --clear-cache
 ```
 
 Use `--yes` for risky operations such as delete and overwrite.
+Use `--no-cache` to bypass local memory and force a fresh LLM classification.
+Use `--history` to inspect recent successful actions.
+Use `--clear-cache` to remove cached classifications and action history.
 
 ## Architecture
 
@@ -54,6 +60,8 @@ flowchart TD
     U[User question] --> CLI[filemanager CLI]
     CLI --> Agent[FileManagerAgent]
     Agent --> Classifier[LLMIntentClassifier]
+    Agent --> Memory[CommandMemory<br/>exact cache + action history]
+    Memory --> Command
     Classifier --> OpenAI[OpenAI Responses API<br/>Structured Outputs]
     OpenAI --> Schema[LLMFileCommand<br/>Pydantic schema]
     Schema --> Command[FileCommand<br/>intent + params + confirmation flag]
@@ -77,6 +85,14 @@ The LLM is used only for classification. It returns a structured command that mu
 - `clarification_question`: question to show when required details are missing
 
 The local agent owns execution. `FileManagerAgent.execute()` looks up the classified intent in the action registry, validates paths stay inside `--root` or the current working directory, blocks unsafe writes, and then calls Python filesystem APIs. The model never receives permission to run shell commands.
+
+`CommandMemory` reduces LLM calls by checking local memory before the OpenAI classifier:
+
+- exact normalized question matches are reused from `classification_cache.json`
+- risky commands and delete commands are not reused from cache
+- successful actions are appended to `action_history.jsonl`
+- narrow follow-ups such as `rename it to archive`, `read it`, and `delete it` can resolve from the most recent successful action
+- cached and history-derived commands still go through the same validation and confirmation checks
 
 Risky operations are intentionally gated:
 
